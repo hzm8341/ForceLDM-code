@@ -64,6 +64,8 @@ def main() -> None:
     parser.add_argument("--frame-stride", type=int, default=30, help="Evaluate every N-th frame of each episode.")
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--include-episodes", type=int, nargs="*", default=None, help="Only evaluate these episodes.")
+    parser.add_argument("--exclude-episodes", type=int, nargs="*", default=None, help="Skip these episodes.")
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, force=True)
@@ -76,6 +78,15 @@ def main() -> None:
     n_hist = int(train_config.model.force_input_frames)
 
     indices = list(range(0, len(dataset), args.frame_stride))
+    if args.include_episodes is not None or args.exclude_episodes:
+        # Filter by episode via the numeric column (no video decoding); stride positions stay identical.
+        base = dataset
+        while not hasattr(base, "hf_dataset"):
+            base = base._dataset
+        ep_col = base.hf_dataset.with_format("numpy")["episode_index"]
+        keep = set(args.include_episodes) if args.include_episodes is not None else None
+        drop = set(args.exclude_episodes or [])
+        indices = [i for i in indices if (keep is None or int(ep_col[i]) in keep) and int(ep_col[i]) not in drop]
     if args.max_samples is not None and len(indices) > args.max_samples:
         rng = np.random.default_rng(args.seed)
         indices = sorted(rng.choice(indices, size=args.max_samples, replace=False).tolist())
@@ -96,7 +107,15 @@ def main() -> None:
         samples.append((obs, gt, item["prompt"], int(item["episode_index"])))
     logging.info("Loaded %d samples", len(samples))
 
-    results = {"config": args.config, "split": args.split, "frame_stride": args.frame_stride, "models": {}}
+    results = {
+        "config": args.config,
+        "split": args.split,
+        "frame_stride": args.frame_stride,
+        "include_episodes": args.include_episodes,
+        "exclude_episodes": args.exclude_episodes,
+        "models": {},
+    }
+    per_sample = {"episode": np.array([s[3] for s in samples]), "prompt": np.array([s[2] for s in samples])}
 
     # Baseline: hold the current state for the whole chunk.
     hold = collections.defaultdict(list)
@@ -105,6 +124,7 @@ def main() -> None:
         hold["all"].append(err)
         hold[prompt].append(err)
     results["models"]["baseline_hold_state"] = {k: _summarize(v) for k, v in hold.items()}
+    per_sample["baseline_hold_state"] = np.stack(hold["all"])
 
     for ckpt in args.checkpoints:
         logging.info("Evaluating %s", ckpt)
@@ -121,6 +141,7 @@ def main() -> None:
             errs["all"].append(err)
             errs[prompt].append(err)
         results["models"][str(ckpt)] = {k: _summarize(v) for k, v in errs.items()}
+        per_sample[str(ckpt)] = np.stack(errs["all"])
         results["models"][str(ckpt)]["all"]["sec_per_sample"] = (time.time() - t0) / len(samples)
         logging.info("%s: %s", ckpt, results["models"][str(ckpt)]["all"])
         del policy
@@ -128,6 +149,8 @@ def main() -> None:
     output = pathlib.Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(results, indent=2, ensure_ascii=False) + "\n")
+    # Signed per-sample errors (pred - gt), shape (N, horizon, 7) per model, for later re-aggregation.
+    np.savez_compressed(output.with_suffix(".errors.npz"), **per_sample)
 
     print(f"\n{'model':60s} {'n':>5s} {'MSE':>10s} {'L1':>8s} {'L1@t1':>8s} {'L1 t1-8':>8s} {'L1 t17-32':>9s}")
     for name, per in results["models"].items():
