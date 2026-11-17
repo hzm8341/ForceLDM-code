@@ -196,6 +196,21 @@ class FakeDataset(Dataset):
         return self._num_samples
 
 
+def _index_episode_data_by_episode_id(dataset: lerobot_dataset.LeRobotDataset) -> None:
+    """Make `episode_data_index` addressable by episode id when only a subset of episodes is loaded.
+
+    LeRobot builds `episode_data_index` positionally over the selected episodes, but `__getitem__` looks it up
+    with the real `episode_index`, which breaks delta-timestamp windows for episode subsets.
+    """
+    n = dataset.meta.total_episodes
+    ep_from = torch.zeros(n, dtype=torch.long)
+    ep_to = torch.zeros(n, dtype=torch.long)
+    for pos, ep in enumerate(dataset.episodes):
+        ep_from[ep] = dataset.episode_data_index["from"][pos]
+        ep_to[ep] = dataset.episode_data_index["to"][pos]
+    dataset.episode_data_index = {"from": ep_from, "to": ep_to}
+
+
 def create_torch_dataset(
     data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
 ) -> Dataset:
@@ -225,8 +240,11 @@ def create_torch_dataset(
 
     dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
+        episodes=list(data_config.episodes) if data_config.episodes is not None else None,
         delta_timestamps=delta_timestamps
     )
+    if data_config.episodes is not None:
+        _index_episode_data_by_episode_id(dataset)
 
     if data_config.prompt_from_task:
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])

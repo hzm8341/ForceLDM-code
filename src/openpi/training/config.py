@@ -67,6 +67,8 @@ class DataConfig:
     norm_stats: dict[str, _transforms.NormStats] | None = None
     max_episodes: int | None = None  # None = 用全部
     rcs_sample_enable: bool = False
+    # Optional subset of LeRobot episode indices to load (None = all episodes).
+    episodes: tuple[int, ...] | None = None
 
     # Used to adopt the inputs from a dataset specific format to a common format
     # which is expected by the data transforms.
@@ -225,6 +227,9 @@ class LeRobotForceLDMDataConfig(DataConfigFactory):
     )
     max_episodes: int | None = None  # None = 用全部
     rcs_sample_enable: bool = False
+    # Optional JSON file {"train": [...], "val": [...]} of episode indices; `split` selects which list to load.
+    split_file: str | None = None
+    split: Literal["train", "val"] = "train"
     use_delta_joint_actions: bool = True # 是否使用相对于当前frame 的action
     delta_action_mask_size: int = 6
     delta_action_mask_offset: int = -1
@@ -286,8 +291,17 @@ class LeRobotForceLDMDataConfig(DataConfigFactory):
             effort_history=self.effort_history,
             prompt_from_task=(self.default_prompt is None),
             max_episodes = self.max_episodes,
-            rcs_sample_enable = self.rcs_sample_enable
+            rcs_sample_enable = self.rcs_sample_enable,
+            episodes=self._load_split_episodes(),
         )
+
+    def _load_split_episodes(self) -> tuple[int, ...] | None:
+        if self.split_file is None:
+            return None
+        import json
+
+        with open(self.split_file) as f:
+            return tuple(int(i) for i in json.load(f)[self.split])
 
     
 @dataclasses.dataclass(frozen=True)
@@ -403,6 +417,18 @@ class TrainConfig:
                 self.model.effort_dim,
             )
 
+_FORCELDM_LORA_MODEL = pi0_config.Pi0ForceLDMConfig(
+    paligemma_variant="gemma_2b_lora",
+    action_expert_variant="gemma_300m_lora",
+    action_horizon=32,
+    effort_type=EffortType.MOT,
+    effort_dim=6,
+    force_input_frames=10,
+    distill_layer_indices=(8, 12, 16),
+    future_force_align_loss_weight=0.5,
+    future_flow_align_loss_weight=0.5,
+)
+
 # Use `get_config` if you need to get a config by name in your code.
 _CONFIGS = [
     TrainConfig(
@@ -440,6 +466,34 @@ _CONFIGS = [
         save_interval=15000,
         keep_period=15000,
         ema_decay = None # 节省显存
+    ),
+    # LoRA variant for single consumer GPUs (e.g. 32GB). PaliGemma, the student expert and the teacher expert
+    # train LoRA adapters only; SigLIP and the new ForceLDM heads train fully. Episodes are split into
+    # train/val by `scripts/make_episode_split.py` so held-out episodes can be evaluated offline.
+    TrainConfig(
+        name="pi0_forceldm_lora",
+        model=_FORCELDM_LORA_MODEL,
+        freeze_filter=_FORCELDM_LORA_MODEL.get_freeze_filter(),
+        data=LeRobotForceLDMDataConfig(
+            camera_mapping={
+                "base_0_rgb": "observation.images.head_camera",
+                "left_wrist_0_rgb": "observation.images.wrist_left_camera",
+            },
+            repo_id="PeiYuan001/forceldm-dataset",
+            effort_history=tuple(list((4 * i - 36 for i in range(10))) + list(range(1, 33))),
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+            extra_delta_transform=False,
+            split_file="splits/forceldm-dataset_val5_seed0.json",
+            split="train",
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("checkpoints/pi0_base/params"),
+        num_train_steps=5_000,
+        batch_size=16,
+        save_interval=1000,
+        keep_period=1000,
+        ema_decay=None,
     ),
     TrainConfig(
         name="pi0_forceldm_noise",
